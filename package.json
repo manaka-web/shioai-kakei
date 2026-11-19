@@ -1,0 +1,12 @@
+{
+  "name": "shioai-household-os",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "start": "node tools/preview.mjs",
+    "test": "node --test",
+    "read-legacy": "node tools/read-legacy.mjs"
+  }
+}
