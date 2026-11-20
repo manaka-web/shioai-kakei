@@ -1,19 +1,22 @@
 import {SCHEMA,active,billKey,canonical,check,control,demoState,emptyState,fold,id,importLegacy,labels,makeClosing,mergeStates,now,put,today,validate,yen} from './domain.js'
 import {createBackup,makeAsset,newVault,profileKey,profiles,readBackup,restoreInto,unlock,verifyAsset} from './storage.js'
-import {Drive,VaultSession,commonBase,finishOAuth,initialPacket,remoteProfiles,startOAuth} from './drive.js'
+import {VaultSession,commonBase,initialPacket,remoteProfiles} from './sync.js'
+import {Dropbox,callbackUrl,finishOAuth,oauthSettings,startOAuth} from './dropbox.js'
 import {config} from './config.js'
 import {badge,billsView,button,docsView,drawCharts,empty,esc,homeView,icon,labelDate,names,note,observationsView,reportsView,section,shell,sortedAccounts,table} from './view.js'
 
 const app=document.querySelector('#app'),modal=document.querySelector('#modal'),toast=document.querySelector('#toast')
 const compass=new URL('../assets/compass.svg',import.meta.url).href
 const startPage=new URL('../index.html',import.meta.url)
+const KEY_SETTING='shioai-dropbox-app-key'
+const appKey=()=>localStorage.getItem(KEY_SETTING) || config.dropboxAppKey || ''
 const bus=typeof BroadcastChannel==='function'?new BroadcastChannel('shioai-family-os'):null
 let session=null, credential=null, drive=null, locals=[], remotes=[], demo=demoState(), mode='demo', range='6'
 let syncing=false, conflict=null, alertText='', lastActive=Date.now(), lastPoll=0, noticeTimer, submitHandler, queuedSync
 const stateNow=()=>session?.state || demo
 const routeNow=()=> Object.hasOwn(names,location.hash.slice(1)) ? location.hash.slice(1) : 'home'
-const validDrive=()=>Boolean(credential && credential.expiresAt>Date.now()+10000)
-const available=()=>validDrive() && navigator.onLine
+const validDropbox=()=>Boolean(credential && credential.expiresAt>Date.now()+10000)
+const available=()=>validDropbox() && navigator.onLine
 const notify=text=>{
   clearTimeout(noticeTimer)
   toast.textContent=text
@@ -26,25 +29,27 @@ const badgeStatus=()=>{
   if (conflict) return {kind:'warning',text:'競合あり'}
   if (syncing) return {kind:'warning',text:'同期中'}
   if (session.profile.identity && !navigator.onLine) return {kind:'warning',text:'オフライン'}
-  if (session.profile.identity && !validDrive()) return {kind:'warning',text:'Drive 再接続が必要'}
+  if (session.profile.identity && !validDropbox()) return {kind:'warning',text:'Dropbox 再接続が必要'}
   if (session.profile.identity && (session.dirty || session.packet.pending)) return {kind:'warning',text:'端末に保存 · 未同期'}
-  if (session.profile.identity && session.packet.syncedAt) return {kind:'ok',text:'Drive 保存確認 '+new Intl.DateTimeFormat('ja-JP',{timeZone:'Asia/Tokyo',hour:'2-digit',minute:'2-digit'}).format(new Date(session.packet.syncedAt))}
+  if (session.profile.identity && session.packet.syncedAt) return {kind:'ok',text:'Dropbox 保存確認 '+new Intl.DateTimeFormat('ja-JP',{timeZone:'Asia/Tokyo',hour:'2-digit',minute:'2-digit'}).format(new Date(session.packet.syncedAt))}
   return {kind:'ok',text:'端末に暗号化保存'}
 }
 function profileRow(p,i,action='unlock') {
-  return button((p.identity?'Google Drive':'この端末')+' · '+p.header.datasetId.slice(0,8),action,{target:String(i),symbol:'lock'})
+  return button((p.identity?'Dropbox':'この端末')+' · '+p.header.datasetId.slice(0,8),action,{target:String(i),symbol:'lock'})
 }
 function lockedView(route) {
-  return (route==='settings'?settingsView():'<section class="locked"><div class="locked-inner"><img src="'+compass+'" alt=""><h2>保管庫を解除</h2><p>パスフレーズで、保存した観測を開きます。</p>'+locals.map((p,i)=>profileRow(p,i)).join('')+remotes.filter(p=>!locals.some(l=>l.key===p.key)).map((p,i)=>button('Drive の保管庫 · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key})).join('')+button('設定へ','settings')+'</div></section>')
+  return (route==='settings'?settingsView():'<section class="locked"><div class="locked-inner"><img src="'+compass+'" alt=""><h2>保管庫を解除</h2><p>パスフレーズで、保存した観測を開きます。</p>'+locals.map((p,i)=>profileRow(p,i)).join('')+remotes.filter(p=>!locals.some(l=>l.key===p.key)).map((p,i)=>button('Dropbox の保管庫 · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key})).join('')+button('設定へ','settings')+'</div></section>')
 }
 function settingsView() {
   const mobile='<div class="subnav"><a href="#reports">レポート</a><a href="#settings" aria-current="page">設定</a></div>'
   const card=(title,text,actions)=>'<section class="panel content-panel"><h3>'+title+'</h3><p>'+esc(text)+'</p>'+actions+'</section>'
   const vaultButtons=locals.map((p,i)=>p.key===session?.profile.key?'':profileRow(p,i)).join('')
-  const remoteButtons=remotes.filter(p=>!locals.some(l=>l.key===p.key)).map(p=>button('Drive · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key,symbol:'lock'})).join('')
+  const remoteButtons=remotes.filter(p=>!locals.some(l=>l.key===p.key)).map(p=>button('Dropbox · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key,symbol:'lock'})).join('')
   const vault=card('保管庫',session?'開いている保管庫 '+session.dataset.slice(0,8)+' · 10分で自動ロック':mode==='demo'?'サンプルの編集はこの画面内だけに保存されます。実際のデータ用には保管庫を作成してください。':'保管庫を選び、パスフレーズで解除します。',button('空の保管庫を作成','new',{variant:session?'secondary':'primary',symbol:'plus'})+(session?button('ロック','lock',{symbol:'lock'}):button('サンプルを開く','demo'))+vaultButtons+remoteButtons)
-  const cloud=card('Google Drive 同期',!config.authOrigin?'配信時の Google Cloud 認証設定を行うと、複数端末で同期できます。':validDrive()?'Google に接続済み。開いている保管庫の接続状態を確認できます。':'同じ Google アカウントで接続すると、Drive の保管庫を選べます。',
-    (!config.authOrigin?'':button(validDrive()?'Google に再接続':'Google Drive に接続','connect',{symbol:'sync'}))+(available() && session ? session.profile.identity===credential.sub ? button('今すぐ同期','sync',{variant:'primary',symbol:'sync'}) : !session.profile.identity?button('この保管庫を Drive に接続','bind',{variant:'primary'}):'' : '')+(validDrive()?button('Drive の保管庫を探す','discover')+button('この端末の接続を終了','disconnect'):'' )+(conflict?button('競合を確認','resolve',{variant:'primary'}):''))
+  const cloud=card('Dropbox 同期',validDropbox()?'Dropbox に接続済み · '+credential.accountLabel:appKey()?'同じ Dropbox アカウントで接続して、保管庫を選びます。':'最初に Dropbox の App key を登録してください。',
+    button(appKey()?'接続設定を確認':'App key を登録','connection-settings')+(appKey()?button(validDropbox()?'Dropbox に再接続':'Dropbox に接続','connect',{symbol:'sync'}):'')+
+    (available() && session ? session.profile.identity===credential.sub ? button('今すぐ同期','sync',{variant:'primary',symbol:'sync'}) : !session.profile.identity?button('この保管庫を Dropbox に接続','bind',{variant:'primary'}):'' : '')+
+    (validDropbox()?button('Dropbox の保管庫を探す','discover')+button('この端末の接続を終了','disconnect'):'')+(conflict?button('競合を確認','resolve',{variant:'primary'}):''))
   const migration=card('旧シートから移行','読み取り専用で取得したスナップショットを選ぶと、7タブの件数と検証結果を確認できます。',session?button('移行ファイルを検証','migration'):button('空の保管庫を作成','new'))
   const backups=card('バックアップと復元','バックアップはパスフレーズで保護されます。別の端末や保管庫でも復元できます。', (session?button('暗号化バックアップを保存','backup'):'' )+button('バックアップを復元','restore')+(session?.packet.retainedDraft?button('競合前の下書きを保存','retained'):''))
   return section('設定','接続、移行、データの保全。')+mobile+(alertText?note(alertText,true):'')+'<div class="settings-grid">'+vault+cloud+migration+backups+'</div>'
@@ -64,7 +69,7 @@ function go(route) {
   else location.hash=route
 }
 async function loadProfiles() {
-  locals=await profiles()
+  locals=(await profiles()).filter(p=>!p.identity || p.identity.startsWith('dropbox:'))
   if (mode==='demo' && session) mode='open'
 }
 function clearVault({showDemo=false}={}) {
@@ -120,21 +125,21 @@ async function sync(reason='save',resolution=null, expected=session) {
     if (conflict) notify('保存の競合があります。差分を確認してください。')
     else {
       try { await expected.cloudBackup(drive,today()) }
-      catch { alertText='Drive へのバックアップを確認できません。次の同期で再試行します。' }
+      catch { alertText='Dropbox へのバックアップを確認できません。次の同期で再試行します。' }
     }
     bus?.postMessage(expected.profile.key)
   }
   try {
     if (navigator.locks?.request) await navigator.locks.request('shioai:'+expected.profile.key,{ifAvailable:true},lock=>lock?run():null)
     else await run()
-  } catch(error) { alertText=error.message || 'Drive 同期を完了できませんでした。'; notify(alertText) }
+  } catch(error) { alertText=error.message || 'Dropbox 同期を完了できませんでした。'; notify(alertText) }
   finally { if (expected===session) {syncing=false;render()} }
 }
 async function discover() {
-  check(available(),'Google Drive に再接続してください。')
+  check(available(),'Dropbox に再接続してください。')
   remotes=await remoteProfiles(drive)
   render()
-  notify(remotes.length?'Drive の保管庫を読み込みました。':'この Google アカウントに保管庫はありません。')
+  notify(remotes.length?'Dropbox の保管庫を読み込みました。':'この Dropbox アカウントに保管庫はありません。')
 }
 function download(blob,filename) {
   const url=URL.createObjectURL(blob),a=document.createElement('a')
@@ -297,7 +302,7 @@ async function getDocument(value) {
 }
 function closingDialog() {
   ensureEdit()
-  check(!session?.profile.identity || available(),'オンラインで Google Drive に接続してから締めを作成してください。')
+  check(!session?.profile.identity || available(),'オンラインで Dropbox に接続してから締めを作成してください。')
   const prev=new Date(today().slice(0,7)+'-01T00:00:00Z'); prev.setUTCDate(0)
   dialog('月次締め',fields(field('対象月','month',prev.toISOString().slice(0,7),{type:'month',required:true,max:prev.toISOString().slice(0,7)}),noteField('','メモ・訂正理由')),async data=>{
     const month=data.get('month'),memo=optional(data,'note')
@@ -337,7 +342,7 @@ function unlockDialog(profile) {
     const root=await unlock(profile.header,data.get('phrase'))
     const next=await VaultSession.existing(profile,root)
     if (!profile.stamp) {
-      check(available() && profile.identity===credential.sub,'同じ Google アカウントで接続してください。')
+      check(available() && profile.identity===credential.sub,'同じ Dropbox アカウントで接続してください。')
       await next.update({...next.packet,vaultFile:profile.vaultFile})
     }
     session=next;mode='open';conflict=null;lastActive=Date.now()
@@ -346,12 +351,25 @@ function unlockDialog(profile) {
     if (session.profile.identity && available()) queuedSync={reason:'save',session}
   },{label:'解除する'})
 }
+function connectionDialog() {
+  check(!syncing,'同期が終わってから接続設定を変更してください。')
+  const redirect=callbackUrl()
+  dialog('Dropbox 接続設定',fields(field('App key','appKey',appKey(),{required:true,wide:true,maxlength:100}))+
+    note('Dropbox の Redirect URIs に、次のURLを登録します。')+
+    '<p class="callback-url">'+esc(redirect)+'</p>',async data=>{
+      const key=String(data.get('appKey') || '').trim()
+      oauthSettings(key,redirect)
+      if (key!==appKey()) {credential=null;drive=null;remotes=[]}
+      localStorage.setItem(KEY_SETTING,key)
+      render();notify('Dropbox の接続設定を保存しました。')
+    },{label:'設定を保存',description:'Dropbox アプリの Settings にある App key を入力してください。'})
+}
 function bindDialog() {
   check(session && available() && !session.profile.identity,'接続できる保管庫を選んでください。')
-  dialog('この保管庫を Drive に接続',note('この保管庫のデータを暗号化した状態で、接続中の Google Drive に送信します。'),async()=>{
-    check(available(),'Google Drive に再接続してください。')
+  dialog('この保管庫を Dropbox に接続',note('この保管庫のデータを暗号化した状態で、接続中の Dropbox に送信します。'),async()=>{
+    check(available(),'Dropbox に再接続してください。')
     const existing=await remoteProfiles(drive)
-    check(!existing.some(p=>p.header.datasetId===session.dataset),'同じ保管庫が Drive にあります。「Drive の保管庫を探す」から開いてください。')
+    check(!existing.some(p=>p.header.datasetId===session.dataset),'同じ保管庫が Dropbox にあります。「Dropbox の保管庫を探す」から開いてください。')
     await session.update(session.packet,[],credential.sub)
     await loadProfiles()
     queuedSync={reason:'save',session}
@@ -396,8 +414,8 @@ async function previewMigration(source,formulas,vault,hasData) {
 function backupDialog(retained=false) {
   check(session && !syncing,'保管庫を解除し、同期が終わってから保存してください。')
   const snapshot=retained?session.packet.retainedDraft:session.profile.identity?session.packet.baseState:session.state
-  check(snapshot && (!session.profile.identity || retained || session.packet.base && !conflict),'Drive の保存確認後にバックアップできます。')
-  dialog('暗号化バックアップ',note(!retained && session.profile.identity && session.dirty?'Drive で確認済みの状態を保存します。未同期の変更は含まれません。':'復元時に、この保管庫のパスフレーズが必要です。'),async()=>{
+  check(snapshot && (!session.profile.identity || retained || session.packet.base && !conflict),'Dropbox の保存確認後にバックアップできます。')
+  dialog('暗号化バックアップ',note(!retained && session.profile.identity && session.dirty?'Dropbox で確認済みの状態を保存します。未同期の変更は含まれません。':'復元時に、この保管庫のパスフレーズが必要です。'),async()=>{
     await exportState(snapshot)
     notify('暗号化バックアップを作成しました。')
   },{label:'ファイルを保存'})
@@ -414,11 +432,11 @@ function restoreDialog() {
     dialog('復元内容を確認',body,async confirm=>{
       if (confirm.get('target')==='current') {
         check(existing && existing===session,'復元先の保管庫を選び直してください。')
-        check(!existing.packet.pending && (!existing.profile.identity || (available() && existing.profile.identity===credential.sub && !existing.dirty)),'Drive の保存確認後に復元してください。')
+        check(!existing.packet.pending && (!existing.profile.identity || (available() && existing.profile.identity===credential.sub && !existing.dirty)),'Dropbox の保存確認後に復元してください。')
         const marker=existing.packet.base
         if (existing.profile.identity) {
           const {heads}=await existing.graph(drive)
-          check(heads.length===1 && heads[0].commitId===marker.commitId,'Drive に更新があります。同期し、復元をやり直してください。')
+          check(heads.length===1 && heads[0].commitId===marker.commitId,'Dropbox に更新があります。同期し、復元をやり直してください。')
           existing.packet.needsBackup=true
           await existing.cloudBackup(drive,today())
         }
@@ -426,7 +444,7 @@ function restoreDialog() {
         const prepared=await restoreInto(restored,existing.root,existing.profile.header)
         if (existing.profile.identity) {
           const {heads}=await existing.graph(drive)
-          check(heads.length===1 && heads[0].commitId===marker.commitId,'退避後に Drive が更新されました。先に同期してください。')
+          check(heads.length===1 && heads[0].commitId===marker.commitId,'退避後に Dropbox が更新されました。先に同期してください。')
         }
         await save(prepared.state,{objects:prepared.objects,reason:'restore',message:'復元内容を保存しました。'})
       } else {
@@ -472,8 +490,8 @@ function resolutionDialog() {
   const current=conflict,vault=session
   const heads=current.graph.heads.map(h=>h.ref)
   const source=current.conflict?
-    [['local','この端末の下書き',current.draft],['drive','Drive の版',current.head.state]]:
-    current.graph.heads.map((h,i)=>[h.commitId,'Drive の版 '+(i+1)+' · '+h.commitId.slice(0,8),h.state])
+    [['local','この端末の下書き',current.draft],['drive','Dropbox の版',current.head.state]]:
+    current.graph.heads.map((h,i)=>[h.commitId,'Dropbox の版 '+(i+1)+' · '+h.commitId.slice(0,8),h.state])
   const base=current.common?.state || emptyState()
   let proposal=current.merged
   if (!proposal && source.length===2 && current.common) proposal=mergeStates(base,source[0][2],source[1][2])
@@ -499,7 +517,7 @@ function resolutionDialog() {
     validate(state)
     await sync('merge',{heads,state},vault)
     check(conflict!==current && !alertText,alertText || '競合の内容が変わりました。再度確認してください。')
-  },{label:'この内容で統合',description:'元の Drive の版は残ります。競合前に端末だけにあった下書きは、設定から暗号化バックアップを保存できます。'})
+  },{label:'この内容で統合',description:'元の Dropbox の版は残ります。競合前に端末だけにあった下書きは、設定から暗号化バックアップを保存できます。'})
 }
 
 async function act(action,value) {
@@ -510,8 +528,8 @@ async function act(action,value) {
     document:()=>documentDialog(value),file:()=>getDocument(value),closing:closingDialog,'closing-view':()=>closingDetail(value),
     new:newDialog,unlock:()=>unlockDialog(locals[Number(value)]),'remote-unlock':()=>unlockDialog(remotes.find(p=>p.key===value)),
     lock:()=>{check(!syncing,'同期が終わってからロックしてください。');clearVault()},demo:()=>{clearVault({showDemo:true});go('home')},
-    connect:()=>startOAuth(config.authOrigin),discover,bind:bindDialog,sync:()=>sync(),resolve:resolutionDialog,
-    disconnect:()=>{check(!syncing,'同期が終わってから接続を終了してください。');credential=null;drive=null;remotes=[];render();notify('この端末の Drive 接続を終了しました。')},
+    'connection-settings':connectionDialog,connect:()=>startOAuth(appKey()),discover,bind:bindDialog,sync:()=>sync(),resolve:resolutionDialog,
+    disconnect:()=>{check(!syncing,'同期が終わってから接続を終了してください。');credential=null;drive=null;remotes=[];render();notify('この端末の Dropbox 接続を終了しました。')},
     backup:()=>backupDialog(),retained:()=>backupDialog(true),restore:restoreDialog,migration:migrationDialog,delete:()=>removeDialog(value),
   }
   if (Object.hasOwn(actions,action)) await actions[action]()
@@ -576,8 +594,8 @@ async function init() {
   mode=locals.length?'locked':'demo'
   if (location.pathname.endsWith('/oauth/callback.html')) {
     try {
-      credential=await finishOAuth(config.authOrigin)
-      if (credential) drive=new Drive(credential)
+      credential=await finishOAuth()
+      if (credential) drive=new Dropbox(credential)
     } catch (error) { alertText=error.message }
     history.replaceState(null,'',startPage.pathname+'#settings')
   }

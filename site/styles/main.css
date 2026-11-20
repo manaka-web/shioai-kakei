@@ -95,6 +95,7 @@ svg{display:block;flex:none}
 .home-memo{margin-top:12px;color:#405b79;font-size:.81rem}
 .home-memo summary{cursor:pointer}
 .home-memo p{white-space:pre-wrap;padding:8px 0 0}
+.callback-url{overflow-wrap:anywhere;font:500 .87rem/1.65 var(--sans);background:#eef4fb;padding:10px;border-radius:6px;user-select:all}
 .content-stack{display:grid;gap:14px}
 .content-panel{padding:16px}
 .content-panel h3{font-size:1rem;margin-bottom:6px}

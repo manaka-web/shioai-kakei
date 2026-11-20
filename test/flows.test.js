@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {SCHEMA,SHEET_IDS,SOURCE_ID,billKey,canonical,closingChanged,control,demoState,emptyState,hash,importLegacy,makeClosing,mergeStates,put,projection,today,validate} from '../site/js/domain.js'
 import {createBackup,makeAsset,newVault,open,readBackup,restoreInto,seal,unlock,verifyAsset} from '../site/js/storage.js'
-import {VaultSession,commonBase,initialPacket} from '../site/js/drive.js'
+import {VaultSession,commonBase,initialPacket} from '../site/js/sync.js'
 import {chartData,homeView,observationsView,billsView,docsView,reportsView,shell} from '../site/js/view.js'
 
 const password='sample grass lighthouse record'

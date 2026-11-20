@@ -1,110 +1,5 @@
-import {canonical,bytes,check,emptyState,hash,id,mergeStates,now,orderState,validate} from './domain.js'
-import {asset,base64,open,persist,profileKey,seal,verifyAsset} from './storage.js'
-
-const api='https://www.googleapis.com/drive/v3/'
-const uploads='https://www.googleapis.com/upload/drive/v3/'
-const keys='id,name,appProperties,size'
-
-export async function startOAuth(origin) {
-  check(origin,'Google Drive に接続するには、公開時の認証設定が必要です。')
-  const verifier=base64(crypto.getRandomValues(new Uint8Array(32)))
-  const challenge=base64(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes(verifier))))
-  const result=await authPost(origin,'start',{challenge})
-  sessionStorage.setItem('shioai-oauth',JSON.stringify({verifier,state:result.state}))
-  location.assign(result.url)
-}
-export async function finishOAuth(origin) {
-  const q=new URLSearchParams(location.search)
-  if (!q.has('code') && !q.has('error')) return null
-  const pending=JSON.parse(sessionStorage.getItem('shioai-oauth') || 'null')
-  history.replaceState(null,'',location.pathname)
-  sessionStorage.removeItem('shioai-oauth')
-  check(!q.has('error'),'Google Drive 接続が中断されました。')
-  check(pending && pending.state===q.get('state'),'認証の有効期限が切れました。もう一度接続してください。')
-  return authPost(origin,'exchange',{code:q.get('code'),state:pending.state,codeVerifier:pending.verifier})
-}
-async function authPost(origin,method,body) {
-  const response=await fetch(new URL('/oauth/'+method,origin),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),cache:'no-store'})
-  check(response.ok,'Google Drive の認証に失敗しました。設定を確認して再接続してください。')
-  return response.json()
-}
-class DriveError extends Error {
-  constructor(status,reason='',retry='') {
-    super(status===401?'Google Drive に再接続してください。':status===403?'Google Drive の権限または利用制限を確認してください。':'Google Drive の応答を確認できません（'+status+'）。')
-    this.status=status
-    this.retry=(status===429 || status>=500 || ['rateLimitExceeded','userRateLimitExceeded'].includes(reason))
-    this.delay=/^\d+$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now()) || 0
-  }
-}
-export class Drive {
-  constructor(credential){ this.credential=credential }
-  async request(url,options={},retry=true) {
-    check(Date.now()<this.credential.expiresAt-10000,'Google Drive に再接続してください。')
-    for (let attempt=0;;attempt++) {
-      let fault
-      try {
-        const response=await fetch(url,{...options,headers:{...options.headers,Authorization:'Bearer '+this.credential.accessToken},cache:'no-store',signal:AbortSignal.timeout(35000)})
-        if (response.ok || response.status===308) return response
-        const body=await response.json().catch(()=>({}))
-        fault=new DriveError(response.status,body.error?.errors?.[0]?.reason,response.headers.get('Retry-After'))
-      } catch(error) { fault=error }
-      if (!retry || attempt>=3 || (fault instanceof DriveError && !fault.retry)) throw fault
-      await new Promise(resolve=>setTimeout(resolve,Math.min(30000,Math.max(fault.delay || 0,400*2**attempt+Math.random()*500))))
-    }
-  }
-  async list() {
-    const out=[],tokens=new Set()
-    let pageToken
-    do {
-      const query=new URLSearchParams({spaces:'appDataFolder',fields:'nextPageToken,incompleteSearch,files('+keys+')',pageSize:'1000',q:"appProperties has { key='app' and value='shioai' }"})
-      if (pageToken) query.set('pageToken',pageToken)
-      const page=await (await this.request(api+'files?'+query)).json()
-      check(!page.incompleteSearch && !tokens.has(page.nextPageToken),'Drive の一覧を完全に取得できません。再試行してください。')
-      out.push(...(page.files || []))
-      pageToken=page.nextPageToken
-      if (pageToken) tokens.add(pageToken)
-    } while(pageToken)
-    return out
-  }
-  async nextId() {
-    const envelope=await (await this.request(api+'files/generateIds?space=appDataFolder&count=1&type=files')).json()
-    check(envelope.ids?.[0],'Drive のファイルIDを取得できません。')
-    return envelope.ids[0]
-  }
-  async get(fileId) {
-    return (await this.request(api+'files/'+encodeURIComponent(fileId)+'?alt=media')).json()
-  }
-  async ensure(fileId,payload,kind,datasetId) {
-    const data=canonical(payload)
-    const verify=async()=>{
-      try {
-        const existing=await this.get(fileId)
-        check(canonical(existing)===data,'Drive の予約済みファイルと送信内容が一致しません。')
-        return true
-      } catch (error) { if (error.status===404) return false; throw error }
-    }
-    if (await verify()) return
-    const metadata={id:fileId,name:'shioai-'+kind+'-'+fileId,mimeType:'application/json',parents:['appDataFolder'],appProperties:{app:'shioai',dataset:datasetId,kind}}
-    try {
-      if (kind==='blob') {
-        const size=bytes(data).byteLength
-        const init=await this.request(uploads+'files?uploadType=resumable',{method:'POST',headers:{'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':'application/json','X-Upload-Content-Length':String(size)},body:JSON.stringify(metadata)},false)
-        const uploadUrl=init.headers.get('Location')
-        check(uploadUrl && new URL(uploadUrl).origin==='https://www.googleapis.com','Drive のアップロードURLを確認できません。')
-        await this.request(uploadUrl,{method:'PUT',headers:{'Content-Type':'application/json'},body:data},false)
-      } else {
-        const boundary='shioai_'+id().replaceAll('-','')
-        const body='--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+JSON.stringify(metadata)+'\r\n--'+boundary+'\r\nContent-Type: application/json\r\n\r\n'+data+'\r\n--'+boundary+'--\r\n'
-        check(bytes(body).byteLength<=5000000,'状態ファイルが Drive の1回の送信上限を超えました。')
-        await this.request(uploads+'files?uploadType=multipart',{method:'POST',headers:{'Content-Type':'multipart/related; boundary='+boundary},body},false)
-      }
-    } catch (error) {
-      if (await verify()) return
-      throw error
-    }
-    check(await verify(),'送信結果を確認できません。同じ操作を再試行できます。')
-  }
-}
+import {canonical,check,emptyState,hash,id,mergeStates,now,orderState,validate} from './domain.js'
+import {asset,open,persist,profileKey,seal,verifyAsset} from './storage.js'
 
 export const initialPacket = state => ({working:state,baseState:emptyState(),base:null,known:[],assetIds:{},pending:null,backup:null})
 export class VaultSession {
@@ -144,15 +39,19 @@ export class VaultSession {
     return packet
   }
   async graph(drive) {
-    check(this.profile.identity===drive.credential.sub,'同じ Google アカウントで再接続してください。')
+    check(this.profile.identity===drive.credential.sub,'同じ Dropbox アカウントで再接続してください。')
     if (!this.packet.vaultFile) return {heads:[],byId:new Map()}
     const files=(await drive.list()).filter(f=>f.appProperties?.dataset===this.dataset && f.appProperties?.kind==='commit')
+    const revisions=new Map(files.map(f=>[f.id,f.revision]))
+    for (const file of files) {
+      if (this.commits.get(file.id)?.remoteRevision!==file.revision) this.commits.delete(file.id)
+    }
     const marker=await drive.get(this.packet.vaultFile)
-    check(canonical(marker.header)===canonical(this.profile.header),'Drive の保管庫鍵が一致しません。')
+    check(canonical(marker.header)===canonical(this.profile.header),'Dropbox の保管庫鍵が一致しません。')
     const {genesis}=await open(this.root,this.dataset,'marker',marker.genesis)
     const byId=new Map(), visiting=new Set(), parentIds=new Set()
     const visit=async(fileId,expected)=>{
-      check(!visiting.has(fileId),'Drive の版に循環があります。')
+      check(!visiting.has(fileId),'Dropbox の版に循環があります。')
       if (byId.has(fileId)) {
         if (expected) check(canonical(byId.get(fileId).ref)===canonical(expected),'親の版ハッシュが一致しません。')
         return
@@ -162,11 +61,11 @@ export class VaultSession {
       if (!commit) {
         const packet=await drive.get(fileId)
         const payload=await open(this.root,this.dataset,'commit',packet)
-        check(payload.schemaVersion===1 && payload.reducerVersion===1 && payload.commitId===packet.objectId && Array.isArray(payload.parentRefs),'Drive の版の形式が無効です。')
+        check(payload.schemaVersion===1 && payload.reducerVersion===1 && payload.commitId===packet.objectId && Array.isArray(payload.parentRefs),'Dropbox の版の形式が無効です。')
         validate(payload.state)
-        check(payload.stateHash===await hash(canonical(orderState(payload.state))),'Drive の状態ハッシュが一致しません。')
+        check(payload.stateHash===await hash(canonical(orderState(payload.state))),'Dropbox の状態ハッシュが一致しません。')
         for (const c of payload.state.monthly_closings.filter(c=>c.inputs)) check(c.input_hash===await hash(canonical(c.inputs)),'締めの入力ハッシュが一致しません。')
-        commit={...payload,ref:{commitId:payload.commitId,driveFileId:fileId,stateHash:payload.stateHash}}
+        commit={...payload,remoteRevision:revisions.get(fileId),ref:{commitId:payload.commitId,driveFileId:fileId,stateHash:payload.stateHash}}
         this.commits.set(fileId,commit)
       }
       if (expected) check(canonical(commit.ref)===canonical(expected),'親の版ハッシュが一致しません。')
@@ -191,7 +90,7 @@ export class VaultSession {
     const uploadDocs=state.documents.filter(d=>d.blob_id)
     for (const doc of uploadDocs) {
       if (doc.drive_file_id) { await verifyAsset(this.root,this.dataset,doc,await drive.get(doc.drive_file_id)); continue }
-      const fileId=this.packet.assetIds[doc.blob_id] || await drive.nextId()
+      const fileId=this.packet.assetIds[doc.blob_id] || await drive.nextId('blob',this.dataset)
       if (!this.packet.assetIds[doc.blob_id]) await this.update({...this.packet,assetIds:{...this.packet.assetIds,[doc.blob_id]:fileId}})
       const payload=await this.document(drive,doc)
       await verifyAsset(this.root,this.dataset,doc,payload)
@@ -199,11 +98,11 @@ export class VaultSession {
     }
     state=orderState(validate({...state,documents:state.documents.map(doc=>doc.blob_id && !doc.drive_file_id?{...doc,drive_file_id:this.packet.assetIds[doc.blob_id]}:doc)}))
     for (const c of state.monthly_closings.filter(c=>c.inputs)) check(c.input_hash===await hash(canonical(c.inputs)),'締めの入力を再確認してください。')
-    const commitId=id(),stateHash=await hash(canonical(state)),fileId=await drive.nextId()
+    const commitId=id(),stateHash=await hash(canonical(state)),fileId=await drive.nextId('commit',this.dataset)
     const payload={schemaVersion:1,reducerVersion:1,commitId,parentRefs:parents,operationId:id(),deviceId:this.profile.deviceId,createdAt:now(),reason,state,stateHash}
     const envelope=await seal(this.root,this.dataset,'commit',payload,commitId)
     const ref={commitId,driveFileId:fileId,stateHash}
-    const newVaultFile=this.packet.vaultFile ? null : await drive.nextId()
+    const newVaultFile=this.packet.vaultFile ? null : await drive.nextId('vault',this.dataset)
     const marker=newVaultFile?{header:this.profile.header,genesis:await seal(this.root,this.dataset,'marker',{genesis:ref})}:null
     await this.update({...this.packet,pending:{fileId,envelope,ref,newVaultFile,marker,state,reason}})
   }
@@ -214,7 +113,7 @@ export class VaultSession {
     await this.update({...this.packet,pending:null,base:pending.ref,baseState:pending.state,working:pending.state,known:[pending.ref],outboxReason:null,vaultFile:pending.newVaultFile || this.packet.vaultFile,syncedAt:now(),needsBackup:['migration','closing','restore'].includes(pending.reason) || this.packet.needsBackup===true})
   }
   async publish(drive,{reason='save',resolution=null}={}) {
-    check(this.profile.identity===drive.credential.sub,'同じ Google アカウントで再接続してください。')
+    check(this.profile.identity===drive.credential.sub,'同じ Dropbox アカウントで再接続してください。')
     if (this.packet.pending) await this.send(drive)
     reason=this.packet.outboxReason || reason
     let graph=await this.graph(drive)
@@ -231,7 +130,7 @@ export class VaultSession {
         if (this.dirty) {
           const merged=mergeStates(this.packet.baseState,draft,head.state)
           try { validate(merged.result) } catch { merged.conflicts.push({id:'制約を満たさない変更'}) }
-          if (reason==='restore') merged.conflicts.push({id:'復元確認後に Drive が更新されました。'})
+          if (reason==='restore') merged.conflicts.push({id:'復元確認後に Dropbox が更新されました。'})
           if (merged.conflicts.length) return {graph,conflict:{head,merged,draft}}
           draft=merged.result
         } else draft=head.state
@@ -251,7 +150,7 @@ export class VaultSession {
     if (!this.packet.backup && this.packet.lastBackup?.commitId===this.packet.base.commitId && !this.packet.needsBackup) return
     if (!this.packet.backup && this.packet.lastBackup?.day===day && !this.packet.needsBackup) return
     if (!this.packet.backup) {
-      const fileId=await drive.nextId()
+      const fileId=await drive.nextId('backup',this.dataset)
       const payload=await seal(this.root,this.dataset,'backup',{date:day,ref:this.packet.base,vaultFile:this.packet.vaultFile,documents:this.packet.baseState.documents.filter(d=>d.blob_id).map(d=>({id:d.blob_id,driveFileId:d.drive_file_id,sha256:d.sha256}))})
       await this.update({...this.packet,backup:{fileId,payload,day,commitId:this.packet.base.commitId}})
     }
@@ -264,7 +163,7 @@ export async function remoteProfiles(drive) {
   const files=(await drive.list()).filter(f=>f.appProperties?.kind==='vault')
   return Promise.all(files.map(async f=>{
     const {header,genesis}=await drive.get(f.id)
-    check(header?.datasetId===f.appProperties.dataset && genesis?.datasetId===header.datasetId,'Drive 保管庫の識別子が一致しません。')
+    check(header?.datasetId===f.appProperties.dataset && genesis?.datasetId===header.datasetId,'Dropbox 保管庫の識別子が一致しません。')
     return {header,identity:drive.credential.sub,key:profileKey(drive.credential.sub,header.datasetId),vaultFile:f.id,stamp:null,deviceId:id()}
   }))
 }

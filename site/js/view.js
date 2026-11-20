@@ -26,7 +26,7 @@ export const link=(label,route)=>'<a class="text-link" href="#'+route+'">'+esc(l
 export const empty=text=>'<p class="empty">'+esc(text)+'</p>'
 export const note=(text,warn=false)=>'<p class="notice'+(warn?' warning':'')+'">'+esc(text)+'</p>'
 export const badge=(type,text=labels[type] || type)=>'<span class="badge" data-kind="'+esc(type)+'">'+esc(text)+'</span>'
-export const shortDate=d=>d?d.slice(5).replace('-','/'):'—'
+export const shortDate=d=>d?d.slice(5,10).replace('-','/'):'—'
 export const labelDate=d=>d?d.replaceAll('-','/'):'—'
 const navs=[
   ['home','home','ホーム'],['observations','wallet','観測点','口座・サービス'],['bills','card','カード請求'],
