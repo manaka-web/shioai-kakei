@@ -17,6 +17,14 @@ export class VaultSession {
   get state(){return this.packet.working}
   get dataset(){return this.profile.header.datasetId}
   get dirty(){return canonical(orderState(this.packet.working))!==canonical(orderState(this.packet.baseState))}
+  async rememberConnection(connection) {
+    check(connection?.sub===this.profile.identity && connection.sub.startsWith('dropbox:'+connection.appKey+':dbid:') && typeof connection.refreshToken==='string' && connection.refreshToken.length>0,'保管庫と Dropbox のアカウントが一致しません。')
+    const safe={sub:connection.sub,appKey:connection.appKey,refreshToken:connection.refreshToken,accountLabel:connection.accountLabel || 'Dropbox'}
+    if (canonical(this.packet.connection ?? null)!==canonical(safe)) await this.update({...this.packet,connection:safe})
+  }
+  async forgetConnection() {
+    await this.update({...this.packet,connection:null})
+  }
   async update(next,objects=[],identity=this.profile.identity) {
     const current=this.profile
     const profile={...current,identity,key:profileKey(identity,this.dataset),stamp:id()}

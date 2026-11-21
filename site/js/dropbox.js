@@ -24,7 +24,7 @@ export async function startOAuth(appKey,redirectUri=callbackUrl()) {
   const state=base64(crypto.getRandomValues(new Uint8Array(32)))
   const pending={...settings,verifier,state,expiresAt:Date.now()+10*60*1000}
   sessionStorage.setItem(PENDING,JSON.stringify(pending))
-  const params=new URLSearchParams({client_id:appKey,redirect_uri:settings.redirectUri,response_type:'code',code_challenge_method:'S256',code_challenge:challenge,state,token_access_type:'online',scope:SCOPES.join(' ')})
+  const params=new URLSearchParams({client_id:appKey,redirect_uri:settings.redirectUri,response_type:'code',code_challenge_method:'S256',code_challenge:challenge,state,token_access_type:'offline',scope:SCOPES.join(' ')})
   location.assign('https://www.dropbox.com/oauth2/authorize?'+params)
 }
 export async function finishOAuth() {
@@ -46,10 +46,23 @@ export async function finishOAuth() {
   check(typeof token.access_token==='string' && token.token_type?.toLowerCase()==='bearer' && Number.isFinite(token.expires_in) && token.expires_in>10,'Dropbox の認証情報を確認できません。')
   const granted=new Set(String(token.scope || '').split(' '))
   check(SCOPES.every(s=>granted.has(s)),'Dropbox の Permissions に必要な4つの権限を設定して再接続してください。')
-  const credential={accessToken:token.access_token,expiresAt:Date.now()+token.expires_in*1000,appKey:pending.appKey}
+  check(typeof token.refresh_token==='string' && token.refresh_token.length>0,'継続接続の情報を取得できませんでした。Dropbox にもう一度接続してください。')
+  const credential={accessToken:token.access_token,expiresAt:Date.now()+token.expires_in*1000,appKey:pending.appKey,refreshToken:token.refresh_token}
   const account=await (await new Dropbox(credential).rpc('users/get_current_account',null)).json()
   check(typeof account.account_id==='string' && account.account_id.startsWith('dbid:') && account.account_id===token.account_id,'Dropbox のアカウントを確認できません。')
   return {...credential,sub:'dropbox:'+pending.appKey+':'+account.account_id,accountLabel:account.name?.display_name || 'Dropbox'}
+}
+
+export function rememberedConnection(credential) {
+  check(credential?.sub?.startsWith('dropbox:'+credential.appKey+':dbid:') && typeof credential.refreshToken==='string' && credential.refreshToken.length>0,'継続接続の情報を確認できません。')
+  return {appKey:credential.appKey,refreshToken:credential.refreshToken,sub:credential.sub,accountLabel:credential.accountLabel || 'Dropbox'}
+}
+
+export class ReconnectRequired extends Error {
+  constructor() {
+    super('Dropbox の接続が解除されています。設定からもう一度接続してください。')
+    this.code='reconnect_required'
+  }
 }
 
 export class DropboxError extends Error {
@@ -72,17 +85,77 @@ export class DropboxError extends Error {
 }
 
 export class Dropbox {
-  constructor(credential){this.credential=credential}
+  constructor(credential,{onRefresh=async()=>{}}={}) {
+    this.credential=credential
+    this.onRefresh=onRefresh
+    this.refreshPromise=null
+    this.disposed=false
+    this.reconnectRequired=false
+  }
+  dispose() {
+    this.disposed=true
+    this.credential.accessToken=''
+    this.credential.refreshToken=null
+    this.credential.expiresAt=0
+  }
+  async ready() {
+    check(!this.disposed,'保管庫を解除してから同期してください。')
+    if (this.reconnectRequired) throw new ReconnectRequired()
+    if (this.credential.expiresAt>Date.now()+60000) return
+    if (!this.credential.refreshToken) {
+      check(this.credential.expiresAt>Date.now()+10000,'Dropbox に再接続してください。')
+      return
+    }
+    if (!this.refreshPromise) this.refreshPromise=this.renew().finally(()=>{this.refreshPromise=null})
+    await this.refreshPromise
+  }
+  async renew() {
+    const saved=rememberedConnection(this.credential)
+    const body=new URLSearchParams({grant_type:'refresh_token',client_id:saved.appKey,refresh_token:saved.refreshToken})
+    const response=await fetch(TOKEN,{method:'POST',body,cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(30000)})
+    if (!response.ok) {
+      const error=await response.json().catch(()=>({}))
+      if (['invalid_grant','invalid_client'].includes(error.error) || response.status===401) {
+        this.reconnectRequired=true
+        throw new ReconnectRequired()
+      }
+      throw new Error('Dropbox への自動接続を完了できません。次の同期で再試行します。')
+    }
+    const token=await response.json()
+    check(typeof token.access_token==='string' && token.token_type?.toLowerCase()==='bearer' && Number.isFinite(token.expires_in) && token.expires_in>60,'Dropbox の更新情報を確認できません。')
+    if (token.scope) check(SCOPES.every(s=>token.scope.split(' ').includes(s)),'Dropbox の接続権限を確認し、再接続してください。')
+    const accountResponse=await fetch(RPC+'users/get_current_account',{method:'POST',body:'null',headers:{'Content-Type':'application/json',Authorization:'Bearer '+token.access_token},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(30000)})
+    check(accountResponse.ok,'Dropbox のアカウント確認を完了できません。次の同期で再試行します。')
+    const account=await accountResponse.json()
+    if (saved.sub!=='dropbox:'+saved.appKey+':'+account.account_id || token.account_id && token.account_id!==account.account_id) {
+      this.reconnectRequired=true
+      throw new ReconnectRequired()
+    }
+    check(!this.disposed,'保管庫がロックされました。')
+    const next={...this.credential,refreshToken:token.refresh_token || saved.refreshToken,accessToken:token.access_token,expiresAt:Date.now()+token.expires_in*1000,accountLabel:account.name?.display_name || saved.accountLabel}
+    // A rotated refresh token is saved before the new access token is used.
+    if (next.refreshToken!==saved.refreshToken) await this.onRefresh(rememberedConnection(next))
+    check(!this.disposed,'保管庫がロックされました。')
+    Object.assign(this.credential,next)
+  }
   async request(url,options={},retry=true) {
-    check(this.credential.expiresAt>Date.now()+10000,'Dropbox に再接続してください。')
+    await this.ready()
+    let renewedAfter401=false
     for (let attempt=0;;attempt++) {
       let fault
       try {
         const response=await fetch(url,{...options,headers:{...options.headers,Authorization:'Bearer '+this.credential.accessToken},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(35000)})
+        check(!this.disposed,'保管庫がロックされました。')
         if (response.ok) return response
+        if (response.status===401 && this.credential.refreshToken && !renewedAfter401) {
+          renewedAfter401=true
+          this.credential.expiresAt=0
+          await this.ready()
+          continue
+        }
         fault=new DropboxError(response.status,await response.json().catch(()=>({})),response.headers.get('Retry-After'))
       } catch(error) {fault=error}
-      if (!retry || attempt>=3 || fault instanceof DropboxError && !fault.retry) throw fault
+      if (this.disposed || !retry || attempt>=3 || fault instanceof ReconnectRequired || fault instanceof DropboxError && !fault.retry) throw fault
       const delay=Math.max(fault.delay || 0,500*2**attempt+Math.random()*500)
       // Long Retry-After values are retried by the next foreground sync.
       if (delay>30000) throw fault
