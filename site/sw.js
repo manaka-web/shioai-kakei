@@ -1,4 +1,4 @@
-const CACHE='shioai-static-dropbox-v1.2'
+const CACHE='shioai-static-dropbox-v1.3'
 const assets=['./','./index.html','./assets/compass.svg','./assets/observatory.webp','./styles/main.css','./js/app.js','./js/config.js','./js/domain.js','./js/sync.js','./js/dropbox.js','./js/preferences.js','./js/storage.js','./js/view.js']
 const urls=new Set(assets.map(path=>new URL(path,self.registration.scope).href))
 self.addEventListener('install',event=>{

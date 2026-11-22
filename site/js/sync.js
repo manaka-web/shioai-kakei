@@ -38,6 +38,7 @@ export class VaultSession {
     validate(state)
     for (const closing of state.monthly_closings.filter(c=>c.inputs && !this.state.monthly_closings.some(o=>o.snapshot_id===c.snapshot_id))) {
       closing.input_hash=await hash(canonical(closing.inputs))
+      if (closing.cashflow_inputs) closing.cashflow_hash=await hash(canonical(closing.cashflow_inputs))
     }
     await this.update({...this.packet,working:state,outboxReason:reason!=='save'?reason:this.packet.outboxReason ?? null},objects)
   }
@@ -69,10 +70,11 @@ export class VaultSession {
       if (!commit) {
         const packet=await drive.get(fileId)
         const payload=await open(this.root,this.dataset,'commit',packet)
-        check(payload.schemaVersion===1 && payload.reducerVersion===1 && payload.commitId===packet.objectId && Array.isArray(payload.parentRefs),'Dropbox の版の形式が無効です。')
+        check(([1,2].includes(payload.schemaVersion) && payload.reducerVersion===payload.schemaVersion) && payload.commitId===packet.objectId && Array.isArray(payload.parentRefs),'新しいデータ形式です。家計OSを最新版へ更新してください。')
         validate(payload.state)
         check(payload.stateHash===await hash(canonical(orderState(payload.state))),'Dropbox の状態ハッシュが一致しません。')
         for (const c of payload.state.monthly_closings.filter(c=>c.inputs)) check(c.input_hash===await hash(canonical(c.inputs)),'締めの入力ハッシュが一致しません。')
+        for (const c of payload.state.monthly_closings.filter(c=>c.cashflow_inputs)) check(c.cashflow_hash===await hash(canonical(c.cashflow_inputs)),'締めの収支ハッシュが一致しません。')
         commit={...payload,remoteRevision:revisions.get(fileId),ref:{commitId:payload.commitId,driveFileId:fileId,stateHash:payload.stateHash}}
         this.commits.set(fileId,commit)
       }
@@ -106,8 +108,9 @@ export class VaultSession {
     }
     state=orderState(validate({...state,documents:state.documents.map(doc=>doc.blob_id && !doc.drive_file_id?{...doc,drive_file_id:this.packet.assetIds[doc.blob_id]}:doc)}))
     for (const c of state.monthly_closings.filter(c=>c.inputs)) check(c.input_hash===await hash(canonical(c.inputs)),'締めの入力を再確認してください。')
+    for (const c of state.monthly_closings.filter(c=>c.cashflow_inputs)) check(c.cashflow_hash===await hash(canonical(c.cashflow_inputs)),'締めの収支を再確認してください。')
     const commitId=id(),stateHash=await hash(canonical(state)),fileId=await drive.nextId('commit',this.dataset)
-    const payload={schemaVersion:1,reducerVersion:1,commitId,parentRefs:parents,operationId:id(),deviceId:this.profile.deviceId,createdAt:now(),reason,state,stateHash}
+    const payload={schemaVersion:2,reducerVersion:2,commitId,parentRefs:parents,operationId:id(),deviceId:this.profile.deviceId,createdAt:now(),reason,state,stateHash}
     const envelope=await seal(this.root,this.dataset,'commit',payload,commitId)
     const ref={commitId,driveFileId:fileId,stateHash}
     const newVaultFile=this.packet.vaultFile ? null : await drive.nextId('vault',this.dataset)

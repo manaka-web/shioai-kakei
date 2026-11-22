@@ -1,10 +1,10 @@
-import {SCHEMA,active,billKey,canonical,check,control,demoState,emptyState,fold,id,importLegacy,labels,makeClosing,mergeStates,now,put,today,validate,yen} from './domain.js'
+import {COLLECTIONS,active,billKey,canonical,check,control,demoState,duplicateCashflow,emptyState,fold,id,importLegacy,labels,makeClosing,mergeStates,now,put,today,validMonth,validate,yen} from './domain.js'
 import {createBackup,makeAsset,newVault,profileKey,profiles,readBackup,restoreInto,unlock,verifyAsset} from './storage.js'
 import {VaultSession,commonBase,initialPacket,remoteProfiles} from './sync.js'
 import {Dropbox,callbackUrl,finishOAuth,oauthSettings,rememberedConnection,startOAuth} from './dropbox.js'
 import {LOCK_OPTIONS,lockDue,lockLabel,preferences,savePreferences} from './preferences.js'
 import {config} from './config.js'
-import {badge,billsView,button,docsView,drawCharts,empty,esc,homeView,icon,labelDate,names,note,observationsView,reportsView,section,shell,sortedAccounts,table} from './view.js'
+import {badge,billsView,button,cashflowView,docsView,drawCharts,empty,esc,flowList,homeView,icon,labelDate,names,note,observationsView,reportsView,section,shell,sortedAccounts,table} from './view.js'
 
 const app=document.querySelector('#app'),modal=document.querySelector('#modal'),toast=document.querySelector('#toast')
 const compass=new URL('../assets/compass.svg',import.meta.url).href
@@ -13,6 +13,7 @@ const KEY_SETTING='shioai-dropbox-app-key'
 const appKey=()=>localStorage.getItem(KEY_SETTING) || config.dropboxAppKey || ''
 const bus=typeof BroadcastChannel==='function'?new BroadcastChannel('shioai-family-os'):null
 let session=null, credential=null, drive=null, locals=[], remotes=[], demo=demoState(), mode='demo', range='6'
+let selectedMonth=today().slice(0,7),flowFilter='all'
 let syncing=false, conflict=null, alertText='', lastActive=Date.now(), lastPoll=0, noticeTimer, submitHandler, queuedSync
 const stateNow=()=>session?.state || demo
 const routeNow=()=> Object.hasOwn(names,location.hash.slice(1)) ? location.hash.slice(1) : 'home'
@@ -52,7 +53,7 @@ async function resumeConnection(vault) {
     catch(error) {alertText=error.message;notify(error.message)}
   }
 }
-const get=(table,key,value)=>stateNow()[table].find(row=>row[key]===value)
+const get=(table,key,value)=>(stateNow()[table] || []).find(row=>row[key]===value)
 const badgeStatus=()=>{
   if (mode==='demo') return {kind:'demo',text:'サンプルデータ'}
   if (mode==='locked') return {kind:'warning',text:'ロック中'}
@@ -71,7 +72,7 @@ function lockedView(route) {
   return (route==='settings'?settingsView():'<section class="locked"><div class="locked-inner"><img src="'+compass+'" alt=""><h2>保管庫を解除</h2><p>パスフレーズで、保存した観測を開きます。</p>'+locals.map((p,i)=>profileRow(p,i)).join('')+remotes.filter(p=>!locals.some(l=>l.key===p.key)).map((p,i)=>button('Dropbox の保管庫 · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key})).join('')+button('設定へ','settings')+'</div></section>')
 }
 function settingsView() {
-  const mobile='<div class="subnav"><a href="#reports">レポート</a><a href="#settings" aria-current="page">設定</a></div>'
+  const mobile='<div class="subnav"><a href="#documents">観測資料</a><a href="#reports">レポート</a><a href="#settings" aria-current="page">設定</a></div>'
   const card=(title,text,actions)=>'<section class="panel content-panel"><h3>'+title+'</h3><p>'+esc(text)+'</p>'+actions+'</section>'
   const vaultButtons=locals.map((p,i)=>p.key===session?.profile.key?'':profileRow(p,i)).join('')
   const remoteButtons=remotes.filter(p=>!locals.some(l=>l.key===p.key)).map(p=>button('Dropbox · '+p.header.datasetId.slice(0,8),'remote-unlock',{target:p.key,symbol:'lock'})).join('')
@@ -85,12 +86,12 @@ function settingsView() {
   const behavior=card('自動ロック・接続の記憶',(pref.autoLockMinutes?'操作がない状態で'+lockLabel(pref.autoLockMinutes)+'後にロック。':'自動ロックなし。')+(pref.rememberDropbox?'この端末では、保管庫の解除後に Dropbox へ自動接続します。':'Dropbox へは手動で接続します。'),button('使い方を設定','preferences'))
   const migration=card('旧シートから移行','読み取り専用で取得したスナップショットを選ぶと、7タブの件数と検証結果を確認できます。',session?button('移行ファイルを検証','migration'):button('空の保管庫を作成','new'))
   const backups=card('バックアップと復元','バックアップはパスフレーズで保護されます。別の端末や保管庫でも復元できます。', (session?button('暗号化バックアップを保存','backup'):'' )+button('バックアップを復元','restore')+(session?.packet.retainedDraft?button('競合前の下書きを保存','retained'):''))
-  return section('設定','接続、移行、データの保全。 · v1.2')+mobile+(alertText?note(alertText,true):'')+'<div class="settings-grid">'+vault+cloud+behavior+migration+backups+'</div>'
+  return section('設定','接続、移行、データの保全。 · v1.3')+mobile+(alertText?note(alertText,true):'')+'<div class="settings-grid">'+vault+cloud+behavior+migration+backups+'</div>'
 }
 function render() {
   const route=routeNow()
   const state=conflict ? conflict.common?.state || emptyState() : stateNow()
-  const view=({home:()=>homeView(state,range),observations:()=>observationsView(state),bills:()=>billsView(state),documents:()=>docsView(state),reports:()=>reportsView(state,range),settings:settingsView})[route]
+  const view=({home:()=>homeView(state,range,selectedMonth),cashflow:()=>cashflowView(state,selectedMonth,flowFilter),observations:()=>observationsView(state),bills:()=>billsView(state),documents:()=>docsView(state),reports:()=>reportsView(state,range,selectedMonth),settings:settingsView})[route]
   const banner=conflict && route!=='settings' ? '<div class="notice warning">競合が見つかりました。確定済みの共通状態を表示しています。 '+button('差分を確認','resolve',{variant:'ghost'})+'</div>' : ''
   const offline=mode==='open' && !navigator.onLine && route!=='settings' ? note('オフライン。変更は端末に下書き保存できます。') : ''
   app.innerHTML=shell(route,badgeStatus(),mode==='locked'?lockedView(route):banner+offline+view(),state.home[0]?.home_title && mode==='open' && state.home[0].home_title!=='しおあい家計OS'?state.home[0].home_title:'')
@@ -267,6 +268,37 @@ function cardDialog(value) {
     field('表示順','sort_order',row?.sort_order,{type:'number',step:1}),field('有効','is_active',row?.is_active ?? true,{type:'checkbox'}),noteField(row?.memo)
   ),async data=>save(put(stateNow(),'cards',{...row,card_name:optional(data,'card_name'),issuer:optional(data,'issuer'),default_debit_account_id:optional(data,'debit'),sort_order:int(data,'sort_order'),is_active:data.has('is_active'),memo:optional(data,'note')})))
 }
+function transactionDialog(value,kind='expense',draft=null) {
+  ensureEdit()
+  const row=get('transactions','transaction_id',value),entry=draft || row
+  kind=entry?.kind || kind
+  const options=aOptions(a=>a.is_active,entry?.account_id)
+  check(options.length,'先に観測点で口座を追加してください。現金も口座として登録できます。')
+  const transfer=kind==='transfer'
+  const date=entry?.occurred_on || (selectedMonth===today().slice(0,7)?today():selectedMonth+'-01')
+  dialog((row?'編集 · ':'')+(kind==='income'?'収入':transfer?'口座間の振替':'支出')+'を記録',fields(
+    field('内容','title',entry?.title,{required:true,maxlength:120,wide:true,placeholder:kind==='income'?'給与・副収入など':transfer?'貯蓄口座への移動など':'現金払い・家賃・口座振替など'}),
+    field('入出金日','occurred_on',date,{type:'date',required:true}),
+    field('状態','status',entry?.status || (date>today()?'planned':'posted'),{opts:[['posted',kind==='income'?'入金済':transfer?'振替済':'支払済'],['planned','予定']]}),
+    field('金額（円）','amount_jpy',entry?.amount_jpy,{type:'number',step:1,min:1,required:true}),
+    choose(transfer?'振替元の口座':kind==='income'?'入金口座':'支払口座','account_id',options,entry?.account_id || options[0][0]),
+    ...(transfer?[choose('振替先の口座','to_account_id',aOptions(a=>a.is_active,entry?.to_account_id),entry?.to_account_id)]:[field('分類（任意）','category',entry?.category,{maxlength:80,placeholder:kind==='income'?'給与・賞与・その他':'住居・生活費・交通など'})]),
+    noteField(entry?.note)
+  )+note(transfer?'自分の口座間の移動です。収入・支出には含めません。残高は別途、観測点で記録します。':'カード利用分は、カード請求の支払済み分から自動で集計します。残高は別途、観測点で記録します。'),async data=>{
+    const next={...row,kind,title:optional(data,'title'),occurred_on:data.get('occurred_on'),status:data.get('status'),amount_jpy:int(data,'amount_jpy'),account_id:data.get('account_id'),to_account_id:transfer?data.get('to_account_id'):null,category:transfer?null:optional(data,'category'),note:optional(data,'note'),recorded_at:row?.recorded_at || now(),updated_at:now()}
+    validate(put(stateNow(),'transactions',next))
+    const commit=async()=>{
+      selectedMonth=next.occurred_on.slice(0,7);flowFilter='all'
+      await save(put(stateNow(),'transactions',next),{message:'収支を保存しました。'})
+    }
+    const matches=duplicateCashflow(stateNow(),next)
+    if (matches.length) {
+      dialog('同じ入出金が登録されています',note('日付・口座・金額・種類・状態が同じ記録があります。カード分を二重に記録していないか確認してください。',true)+flowList(stateNow(),matches),commit,{label:'別の収支として登録',aux:button('入力へ戻る','transaction-draft',{target:JSON.stringify(next)}),description:'既存の記録は、選ぶと編集できます。'})
+      return false
+    }
+    await commit()
+  },{aux:deleted('transactions','transaction_id',row)})
+}
 function billDialog(value) {
   ensureEdit()
   const row=get('bills','bill_id',value)
@@ -278,7 +310,7 @@ function billDialog(value) {
     field('請求月','statement_month',row?.statement_month || today().slice(0,7),{type:'month',required:true}),field('引落日','payment_date',row?.payment_date || today(),{type:'date',required:true}),
     field('金額（円）','amount_jpy',row?.amount_jpy,{type:'number',step:1,required:true}),field('支払状況','status',row?.payment_status || 'Estimated',{opts:['Estimated','Confirmed','Paid'].map(s=>[s,labels[s]])}),
     field('支払日','paid_on',row?.paid_on,{type:'date',max:today()}),noteField(row?.note)
-  ),async data=>{
+  )+note('「支払済」は支払日で支出へ反映します。見込・確定は支払予定として表示します。'),async data=>{
     const state=stateNow()
     const next={...row,card_id:data.get('card_id'),debit_account_id:data.get('debit'),statement_month:data.get('statement_month'),payment_date:data.get('payment_date'),amount_jpy:int(data,'amount_jpy'),payment_status:data.get('status'),paid_on:data.get('status')==='Paid'?optional(data,'paid_on'):null,note:optional(data,'note'),updated_at:now(),reporting_disposition:row?.reporting_disposition || 'included'}
     const accountChanged=row?.debit_account_id!==next.debit_account_id
@@ -295,7 +327,14 @@ function billDialog(value) {
       for(const other of others) result=put(result,'bills',{...other,reporting_disposition:'pending'})
       next.reporting_disposition='pending'
     }
-    await save(put(result,'bills',next))
+    const updated=put(result,'bills',next)
+    validate(updated)
+    const matches=next.reporting_disposition==='included'?duplicateCashflow(updated,{kind:'expense',status:next.payment_status==='Paid'?'posted':'planned',occurred_on:next.payment_status==='Paid'?next.paid_on:next.payment_date,amount_jpy:next.amount_jpy,account_id:next.debit_account_id}).filter(x=>x.source==='manual'):[]
+    if (matches.length) {
+      dialog('手入力と同じ支払いがあります',note('同じ日付・口座・金額・状態の手入力があります。この請求を保存すると、両方が支出または予定額に含まれます。',true)+flowList(stateNow(),matches),async()=>save(updated),{label:'別の支払いとして保存',description:'既存の手入力は、選ぶと編集できます。重複分は削除してください。'})
+      return false
+    }
+    await save(updated)
   },{aux:deleted('bills','bill_id',row)})
   const form=modal.querySelector('form')
   form.elements.card_id.addEventListener('change',event=>{
@@ -347,9 +386,9 @@ function closingDialog() {
     const month=data.get('month'),memo=optional(data,'note')
     const closing=makeClosing(stateNow(),month,memo)
     const inputs=closing.inputs.map(x=>[esc(get('accounts','account_id',x.account_id)?.account_name),esc(labelDate(x.observed_on)),[esc(yen(x.balance_jpy))]])
-    dialog('月次締めを確定',note('観測 '+closing.observed_count+' / '+closing.target_count+' 口座 · 総残高 '+yen(closing.total_balance_jpy),closing.observed_count<closing.target_count)+table(['口座','採用日','残高'],inputs),async()=>{
+    dialog('月次締めを確定',note('観測 '+closing.observed_count+' / '+closing.target_count+' 口座 · 総残高 '+yen(closing.total_balance_jpy),closing.observed_count<closing.target_count)+note('収入 '+yen(closing.income_jpy)+' · 支出 '+yen(closing.expense_jpy)+' · 差額 '+yen(closing.net_jpy))+note('入出金済みを締めます。予定・要照合の請求は収支に含めません。')+table(['口座','採用日','残高'],inputs),async()=>{
       const verified=makeClosing(stateNow(),month,memo)
-      check(canonical(verified.inputs)===canonical(closing.inputs),'観測が更新されました。締めをやり直してください。')
+      check(canonical(verified.inputs)===canonical(closing.inputs) && canonical(verified.cashflow_inputs)===canonical(closing.cashflow_inputs),'観測または収支が更新されました。締めをやり直してください。')
       await save(put(stateNow(),'monthly_closings',verified),{reason:'closing'})
     },{label:'この内容で確定'})
     return false
@@ -359,7 +398,8 @@ function closingDetail(value) {
   const row=get('monthly_closings','snapshot_id',value)
   check(row,'締めが見つかりません。')
   const rows=row.inputs?.map(x=>[esc(get('accounts','account_id',x.account_id)?.account_name),esc(labelDate(x.observed_on)),[esc(yen(x.balance_jpy))]])
-  dialog(row.snapshot_date.slice(0,7)+' の締め',note('総残高 '+yen(row.total_balance_jpy)+' · '+row.observed_count+' / '+row.target_count+' 口座')+(rows?table(['口座','観測日','残高'],rows):empty('旧締めは集計値を移行済みです。'))+(row.note?note(row.note):''))
+  const flows=row.cashflow_inputs?.map(x=>[esc(labelDate(x.occurred_on)),esc({income:'収入',expense:'支出',transfer:'振替'}[x.kind]),esc(get('accounts','account_id',x.account_id)?.account_name),[esc(yen(x.amount_jpy))]])
+  dialog(row.snapshot_date.slice(0,7)+' の締め',note('総残高 '+yen(row.total_balance_jpy)+' · '+row.observed_count+' / '+row.target_count+' 口座')+(rows?table(['口座','観測日','残高'],rows):empty('旧締めは集計値を移行済みです。'))+(flows?note('収入 '+yen(row.income_jpy)+' · 支出 '+yen(row.expense_jpy)+' · 差額 '+yen(row.net_jpy))+table(['入出金日','種類','口座','金額'],flows):note('この旧締めには収支が保存されていません。'))+(row.note?note(row.note):''))
 }
 
 function password(label,name='phrase',create=false) {
@@ -446,7 +486,7 @@ function migrationDialog() {
   ensureEdit()
   const vault=session
   check(vault,'空の保管庫を作成してください。')
-  const evidence=state=>state.migrationHistory.length || Object.values(SCHEMA).some(([key])=>state[key].length)
+  const evidence=state=>state.migrationHistory.length || COLLECTIONS.some(([key])=>state[key]?.length)
   dialog('旧シートの移行を検証',fields(field('読み取り専用スナップショット（JSON）','source','',{type:'file',accept:'.json,application/json',required:true,wide:true})),async data=>{
     const file=data.get('source')
     check(file?.size>0 && file.size<=15*1024*1024,'15 MiB 以内のスナップショットを選んでください。')
@@ -527,7 +567,7 @@ function restoreDialog() {
 function removeDialog(text) {
   ensureEdit()
   const [collection,key,id]=JSON.parse(text)
-  check(['observations','bills','documents'].includes(collection),'この記録は無効化で管理します。')
+  check(['observations','bills','documents','transactions'].includes(collection) && COLLECTIONS.some(([table,pk])=>table===collection && pk===key),'この記録は無効化で管理します。')
   const row=get(collection,key,id)
   check(row,'対象の記録がありません。')
   if (collection==='bills') check(!stateNow().bills.some(b=>b.superseded_by===id && !b.deleted_at) && !stateNow().documents.some(d=>d.bill_id===id && !d.deleted_at),'資料や置換元の関連付けを先に確認してください。')
@@ -536,17 +576,17 @@ function removeDialog(text) {
   },{label:'削除する'})
 }
 function humanDiff(base,state) {
-  const descriptions={accounts:'口座',observations:'観測',cards:'カード',bills:'請求',documents:'資料',home:'ホーム',monthly_closings:'締め'}
+  const descriptions={accounts:'口座',observations:'観測',cards:'カード',bills:'請求',documents:'資料',home:'ホーム',monthly_closings:'締め',transactions:'収支'}
   const out=[]
-  for (const [table,pk] of Object.values(SCHEMA)) {
-    const a=fold(base[table],pk),b=fold(state[table],pk)
+  for (const [table,pk] of COLLECTIONS) {
+    const a=fold(base[table] || [],pk),b=fold(state[table] || [],pk)
     for (const key of new Set([...a.keys(),...b.keys()])) {
       const x=a.get(key),y=b.get(key)
       if (canonical(x ?? null)===canonical(y ?? null)) continue
       const r=y || x
-      const name=r.account_name || r.card_name || r.service_name || get('accounts','account_id',r.account_id)?.account_name || get('cards','card_id',r.card_id)?.card_name || ''
+      const name=r.title || r.account_name || r.card_name || r.service_name || get('accounts','account_id',r.account_id)?.account_name || get('cards','card_id',r.card_id)?.card_name || ''
       const value=r.balance_jpy ?? r.amount_jpy ?? r.total_balance_jpy
-      out.push([descriptions[table],(!y || y.deleted_at?'削除':!x?'追加':'変更'),name,r.observed_on || r.statement_month || r.snapshot_date || '',value==null?'':yen(value)].filter(Boolean).join(' · '))
+      out.push([descriptions[table],(!y || y.deleted_at?'削除':!x?'追加':'変更'),name,r.occurred_on || r.observed_on || r.statement_month || r.snapshot_date || '',value==null?'':yen(value)].filter(Boolean).join(' · '))
     }
   }
   return out
@@ -589,6 +629,10 @@ function resolutionDialog() {
 async function act(action,value) {
   const actions={
     range:()=>{range=value;render()},settings:()=>go('settings'),close:()=>modal.close(),
+    'month-step':()=>{const date=new Date(selectedMonth+'-01T00:00:00Z');date.setUTCMonth(date.getUTCMonth()+Number(value));const next=date.toISOString().slice(0,7);if(validMonth(next)){selectedMonth=next;render()}},
+    'month-today':()=>{selectedMonth=today().slice(0,7);render()},'flow-filter':()=>{flowFilter=value;render()},
+    income:()=>transactionDialog('','income'),expense:()=>transactionDialog('','expense'),transfer:()=>transactionDialog('','transfer'),transaction:()=>transactionDialog(value),
+    'transaction-draft':()=>{const draft=JSON.parse(value);transactionDialog(draft.transaction_id,draft.kind,draft)},
     account:()=>accountDialog(value),observation:()=>observationDialog(value), 'one-observation':()=>observationDialog('',value),'obs-history':()=>historyDialog(value),
     card:()=>cardDialog(value),bill:()=>billDialog(value),'bill-review':()=>reviewBills(value),
     document:()=>documentDialog(value),file:()=>getDocument(value),closing:closingDialog,'closing-view':()=>closingDetail(value),
@@ -636,6 +680,12 @@ modal.addEventListener('cancel',event=>{if (modal.querySelector('form')?.dataset
 modal.addEventListener('close',()=>{modal.replaceChildren();submitHandler=null})
 window.addEventListener('hashchange',()=>{if (modal.open) modal.close();render();window.scrollTo(0,0)})
 window.addEventListener('resize',()=>{if (mode!=='locked') drawCharts(conflict?.common?.state || stateNow(),range)})
+document.addEventListener('change',event=>{
+  if (event.target.matches('[data-month]')) {
+    if (validMonth(event.target.value)) selectedMonth=event.target.value
+    render()
+  }
+})
 const recordActivity=()=>{lastActive=Date.now()}
 for (const event of ['pointerdown','keydown','input','scroll']) window.addEventListener(event,recordActivity,{passive:true,capture:true})
 window.addEventListener('online',()=>{render();void sync()})

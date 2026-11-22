@@ -142,14 +142,14 @@ export async function createBackup(root,header,state,loadAsset,baseRef=null) {
   }
   const records=await Promise.all(entries.map(async e=>({id:e.objectId,type:e.objectType,bytes:input(e).length,sha256:await hash(input(e))})))
   const manifest=await seal(root,datasetId,'backup',{createdAt:new Date().toISOString(),baseRef,stateHash:await hash(canonical(orderState(state))),records})
-  const file=new Blob([canonical({format:'shioai-backup',version:1,keyHeader:header,manifest,entries})],{type:'application/json'})
+  const file=new Blob([canonical({format:'shioai-backup',version:2,keyHeader:header,manifest,entries})],{type:'application/json'})
   check(file.size<=BACKUP_LIMIT,'バックアップが100 MiBの上限を超えました。')
   return file
 }
 export async function readBackup(file,phrase) {
   check(file?.size<=BACKUP_LIMIT,'バックアップは100 MiB以内のファイルを選んでください。')
   const data=JSON.parse(await file.text())
-  check(data.format==='shioai-backup' && data.version===1 && Array.isArray(data.entries),'バックアップ形式を確認してください。')
+  check(data.format==='shioai-backup' && [1,2].includes(data.version) && Array.isArray(data.entries),'バックアップ形式を確認してください。')
   const header=data.keyHeader, root=await unlock(header,phrase), datasetId=header.datasetId
   const manifest=await open(root,datasetId,'backup',data.manifest)
   const entries=new Map(data.entries.map(e=>[e.objectId,e]))

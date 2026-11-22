@@ -7,6 +7,7 @@ export const SCHEMA = {
   Home: ['home','home_id','home_title','overview_note'],
   MonthlyClosings: ['monthly_closings','snapshot_id','snapshot_date','note','recorded_at','total_balance_jpy','observed_count','target_count','liquid_balance_jpy','term_balance_jpy'],
 }
+export const COLLECTIONS=[...Object.values(SCHEMA).map(([table,pk])=>[table,pk]),['transactions','transaction_id']]
 export const SOURCE_ID = '1ZyFxpgV1yXho2hvGgAHtApIOZe5nro8UFpbDZzvLmhY'
 export const SHEET_IDS = [653572779, 1101, 1102, 1103, 1104, 1105, 1110]
 export const labels = {Bank:'銀行',EWallet:'電子マネー',Ordinary:'普通預金',Term:'定期預金',Estimated:'見込',Confirmed:'確定',Paid:'支払済',pending:'要照合',superseded:'置換済'}
@@ -32,10 +33,11 @@ export const validMonth = value => typeof value === 'string' && /^\d{4}-(0[1-9]|
 export const validInstant = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T.*Z$/.test(value) && !Number.isNaN(Date.parse(value))
 export const monthEnd = month => new Date(Date.parse(month+'-01T00:00:00Z') + 32*86400000 - new Date(Date.parse(month+'-01T00:00:00Z') + 32*86400000).getUTCDate()*86400000).toISOString().slice(0,10)
 export function emptyState() {
-  return {...Object.fromEntries(Object.values(SCHEMA).map(([key]) => [key,[]])),migrationHistory:[]}
+  return {...Object.fromEntries(COLLECTIONS.map(([key]) => [key,[]])),migrationHistory:[]}
 }
 export function orderState(state) {
-  return {...state,...Object.fromEntries(Object.values(SCHEMA).map(([key,pk]) => [key,[...state[key]].sort((a,b) => compare(a[pk],b[pk]))]))}
+  // Missing optional collections stay absent so old commit hashes still match.
+  return {...state,...Object.fromEntries(COLLECTIONS.filter(([key])=>Object.hasOwn(state,key)).map(([key,pk]) => [key,[...state[key]].sort((a,b) => compare(a[pk],b[pk]))]))}
 }
 export const fold = (rows,key) => new Map(rows.map(r => [r[key],r]))
 export const billKey = r => r.card_id+'|'+r.statement_month
@@ -47,8 +49,8 @@ export const total = list => list.reduce((a,b) => {
 },0)
 export function validate(state) {
   check(state && Array.isArray(state.migrationHistory),'データ形式が一致しません。')
-  for (const [table,pk] of Object.values(SCHEMA)) {
-    const rows = state[table]
+  for (const [table,pk] of COLLECTIONS) {
+    const rows = table==='transactions' && !Object.hasOwn(state,table)?[]:state[table]
     check(Array.isArray(rows) && rows.every(r => r && typeof r[pk] === 'string' && r[pk].trim() && typeof r.record_rev === 'string'), table+' の主キーまたは版が無効です。')
     check(new Set(rows.map(r => r[pk])).size === rows.length,table+' に重複IDがあります。')
   }
@@ -61,6 +63,12 @@ export function validate(state) {
     check(card.has(b.card_id) && account.has(b.debit_account_id) && validMonth(b.statement_month) && validDate(b.payment_date) && Number.isSafeInteger(b.amount_jpy),'請求のカード・引落口座・月・日付・金額を確認してください。')
     check(['Estimated','Confirmed','Paid'].includes(b.payment_status) && (b.payment_status==='Paid' ? validDate(b.paid_on) : b.paid_on==null) && (b.updated_at==null || validInstant(b.updated_at)),'支払状況と支払日を確認してください。')
     check(['included','pending','superseded'].includes(b.reporting_disposition) && (b.reporting_disposition!=='superseded' || (bill.has(b.superseded_by) && b.superseded_by!==b.bill_id && billKey(bill.get(b.superseded_by))===billKey(b))),'請求の照合状態を確認してください。')
+  }
+  for (const t of state.transactions || []) {
+    check(['income','expense','transfer'].includes(t.kind) && ['posted','planned'].includes(t.status) && typeof t.title==='string' && t.title.trim().length>0 && t.title.length<=120,'収支の種類・状態・内容を確認してください。')
+    check(validDate(t.occurred_on) && (t.status!=='posted' || t.occurred_on<=today()) && Number.isSafeInteger(t.amount_jpy) && t.amount_jpy>0 && account.has(t.account_id) && validInstant(t.recorded_at) && validInstant(t.updated_at),'収支の日付・金額・口座を確認してください。')
+    check(t.category==null || typeof t.category==='string' && t.category.length<=80,'収支の分類を確認してください。')
+    check(t.kind==='transfer'?account.has(t.to_account_id) && t.to_account_id!==t.account_id:t.to_account_id==null,'振替元・振替先の口座を確認してください。')
   }
   for (const d of state.documents) {
     check(validMonth(d.document_month) && nonempty(d.service_name) && validInstant(d.recorded_at) && ['PDF','CSV','Other'].includes(d.document_type) && (d.bill_id==null || bill.has(d.bill_id)),'資料の月・サービス・種類・請求参照を確認してください。')
@@ -75,6 +83,12 @@ export function validate(state) {
       const seen=c.inputs.filter(x=>x.balance_jpy!=null)
       check(seen.length===c.observed_count && total(seen.filter(x=>x.balance_category==='Term').map(x=>x.balance_jpy))===c.term_balance_jpy && total(seen.filter(x=>x.balance_category!=='Term').map(x=>x.balance_jpy))===c.liquid_balance_jpy,'保存済みの締め明細と内訳が一致しません。')
     }
+    check(c.calculation_version!==2 || Array.isArray(c.cashflow_inputs),'締めの収支明細がありません。')
+    if (Object.hasOwn(c,'cashflow_inputs')) {
+      check(Array.isArray(c.cashflow_inputs) && new Set(c.cashflow_inputs.map(x=>x?.entry_id)).size===c.cashflow_inputs.length && c.cashflow_inputs.every(x=>x && ['income','expense','transfer'].includes(x.kind) && ['manual','bill'].includes(x.source) && typeof x.entry_id==='string' && x.entry_id.startsWith(x.source==='bill'?'bill:':'transaction:') && (x.source!=='bill' || x.kind==='expense') && validDate(x.occurred_on) && x.occurred_on.slice(0,7)===c.snapshot_date.slice(0,7) && Number.isSafeInteger(x.amount_jpy) && (x.source==='bill' || x.amount_jpy>0) && account.has(x.account_id) && (x.kind==='transfer'?account.has(x.to_account_id) && x.to_account_id!==x.account_id:x.to_account_id==null)),'締めの収支明細を確認してください。')
+      const amount=kind=>total(c.cashflow_inputs.filter(x=>x.kind===kind).map(x=>x.amount_jpy))
+      check(c.income_jpy===amount('income') && c.expense_jpy===amount('expense') && c.net_jpy===total([c.income_jpy,-c.expense_jpy]),'締めの収支と明細が一致しません。')
+    }
     if (c.supersedes_snapshot_id) check(c.supersedes_snapshot_id!==c.snapshot_id && closings.some(p=>p.snapshot_id===c.supersedes_snapshot_id && p.snapshot_date.slice(0,7)===c.snapshot_date.slice(0,7)),'訂正対象の締めが見つかりません。')
   }
   check(new Set(currentClosings(state).map(c=>c.snapshot_date.slice(0,7))).size===currentClosings(state).length,'同じ月に有効な締めが複数あります。')
@@ -86,9 +100,9 @@ export function currentClosings(state) {
   return rows.filter(r=>!superseded.has(r.snapshot_id))
 }
 export function put(state, table, row) {
-  const pk = Object.values(SCHEMA).find(s=>s[0]===table)[1]
+  const pk = COLLECTIONS.find(s=>s[0]===table)[1]
   const stored = {...row,[pk]:row[pk] || id(),record_rev:id()}
-  return {...state,[table]:[...state[table].filter(r=>r[pk]!==stored[pk]),stored]}
+  return {...state,[table]:[...(state[table] || []).filter(r=>r[pk]!==stored[pk]),stored]}
 }
 export function projection(state, date=today(), fixed=null) {
   const accounts = fixed || active(state.accounts).filter(a=>a.is_active && a.include_total)
@@ -110,10 +124,42 @@ export function makeClosing(state,month,note) {
   const prior=currentClosings(state).find(c=>c.snapshot_date.startsWith(month))
   check(!prior || note,'締めの訂正理由を入力してください。')
   const p=projection(state,date,prior?.inputs || null)
-  return {snapshot_date:date,note:note || null,recorded_at:now(),total_balance_jpy:p.total ?? 0,liquid_balance_jpy:p.liquid,term_balance_jpy:p.term,observed_count:p.seen,target_count:p.target,inputs:p.inputs,supersedes_snapshot_id:prior?.snapshot_id ?? null,calculation_version:1}
+  const flow=cashflowSummary(state,month)
+  return {snapshot_date:date,note:note || null,recorded_at:now(),total_balance_jpy:p.total ?? 0,liquid_balance_jpy:p.liquid,term_balance_jpy:p.term,observed_count:p.seen,target_count:p.target,inputs:p.inputs,cashflow_inputs:cashflowInputs(state,month),income_jpy:flow.income,expense_jpy:flow.expense,net_jpy:flow.net,supersedes_snapshot_id:prior?.snapshot_id ?? null,calculation_version:2}
 }
 export function closingChanged(state, closing) {
-  return Boolean(closing.inputs && canonical(projection(state,closing.snapshot_date,closing.inputs).inputs)!==canonical(closing.inputs))
+  return Boolean(closing.inputs && canonical(projection(state,closing.snapshot_date,closing.inputs).inputs)!==canonical(closing.inputs) ||
+    closing.cashflow_inputs && canonical(cashflowInputs(state,closing.snapshot_date.slice(0,7)))!==canonical(closing.cashflow_inputs))
+}
+export function cashflowEntries(state,month=null) {
+  const manual=active(state.transactions || []).map(t=>({...t,entry_id:'transaction:'+t.transaction_id,source:'manual',source_id:t.transaction_id}))
+  const cards=fold(state.cards,'card_id')
+  const bills=active(state.bills).filter(b=>b.reporting_disposition==='included').map(b=>({
+    entry_id:'bill:'+b.bill_id,source:'bill',source_id:b.bill_id,kind:'expense',
+    status:b.payment_status==='Paid'?'posted':'planned',occurred_on:b.payment_status==='Paid'?b.paid_on:b.payment_date,
+    amount_jpy:b.amount_jpy,account_id:b.debit_account_id,to_account_id:null,category:'カード引落',
+    title:(cards.get(b.card_id)?.card_name || 'カード')+' · '+b.statement_month+'請求',note:b.note,
+    estimated:b.payment_status==='Estimated',recorded_at:b.updated_at || b.payment_date+'T00:00:00.000Z'
+  }))
+  return [...manual,...bills].filter(x=>!month || x.occurred_on?.startsWith(month)).sort((a,b)=>compare(b.occurred_on,a.occurred_on) || compare(a.entry_id,b.entry_id))
+}
+export function cashflowInputs(state,month) {
+  return cashflowEntries(state,month).filter(x=>x.status==='posted').map(x=>({
+    entry_id:x.entry_id,source:x.source,kind:x.kind,occurred_on:x.occurred_on,
+    account_id:x.account_id,to_account_id:x.to_account_id || null,amount_jpy:x.amount_jpy
+  })).sort((a,b)=>compare(a.entry_id,b.entry_id))
+}
+export function cashflowSummary(state,month) {
+  check(validMonth(month),'対象月を確認してください。')
+  const entries=cashflowEntries(state,month)
+  const amount=(kind,status)=>total(entries.filter(x=>x.kind===kind && x.status===status).map(x=>x.amount_jpy))
+  const income=amount('income','posted'),expense=amount('expense','posted')
+  const unresolved=active(state.bills).filter(b=>b.reporting_disposition==='pending' && (b.payment_status==='Paid'?b.paid_on:b.payment_date)?.startsWith(month)).length
+  return {income,expense,net:total([income,-expense]),plannedIncome:amount('income','planned'),plannedExpense:amount('expense','planned'),transfers:amount('transfer','posted'),unresolved}
+}
+export function duplicateCashflow(state,entry) {
+  if (entry.kind==='transfer') return []
+  return cashflowEntries(state).filter(x=>x.entry_id!=='transaction:'+entry.transaction_id && x.kind===entry.kind && x.status===entry.status && x.account_id===entry.account_id && x.occurred_on===entry.occurred_on && x.amount_jpy===entry.amount_jpy)
 }
 export function control(state) {
   const count = {}, observationTotals = new Map(), billTotals = new Map()
@@ -189,8 +235,8 @@ export async function importLegacy(source, allowFormulas=false) {
 }
 export function mergeStates(base,left,right) {
   const result=emptyState(), conflicts=[]
-  for (const [key,pk] of Object.values(SCHEMA)) {
-    const a=fold(base[key],pk), b=fold(left[key],pk), c=fold(right[key],pk)
+  for (const [key,pk] of COLLECTIONS) {
+    const a=fold(base[key] || [],pk), b=fold(left[key] || [],pk), c=fold(right[key] || [],pk)
     for (const k of new Set([...a.keys(),...b.keys(),...c.keys()])) {
       const x=a.get(k), y=b.get(k), z=c.get(k)
       const comparable = r=>{ if (!r) return null; const {record_rev,updated_at,drive_file_id,...value}=r; return canonical(value) }
@@ -203,10 +249,10 @@ export function mergeStates(base,left,right) {
     }
   }
   result.migrationHistory=[...new Map([...left.migrationHistory,...right.migrationHistory].map(x=>[x.sourceFingerprint,x])).values()]
-  for (const [table,key,group] of [['observations','observation_id',obsKey],['bills','bill_id',billKey],['monthly_closings','snapshot_id',r=>r.snapshot_date.slice(0,7)]]) {
-    const seen=new Set(base[table].map(r=>r[key]))
-    const l=left[table].filter(r=>!seen.has(r[key]) && !r.deleted_at)
-    const r=right[table].filter(r=>!seen.has(r[key]) && !r.deleted_at)
+  for (const [table,key,group] of [['observations','observation_id',obsKey],['bills','bill_id',billKey],['monthly_closings','snapshot_id',r=>r.snapshot_date.slice(0,7)],['transactions','transaction_id',r=>[r.kind,r.status,r.occurred_on,r.account_id,r.to_account_id || '',r.amount_jpy].join('|')]]) {
+    const seen=new Set((base[table] || []).map(r=>r[key]))
+    const l=(left[table] || []).filter(r=>!seen.has(r[key]) && !r.deleted_at)
+    const r=(right[table] || []).filter(r=>!seen.has(r[key]) && !r.deleted_at)
     for (const first of l) if (r.some(second=>second[key]!==first[key] && group(second)===group(first))) conflicts.push({table,id:group(first),group:true})
   }
   const old=new Set(base.monthly_closings.map(c=>c.snapshot_id))
@@ -238,6 +284,22 @@ export function demoState() {
   }
   for (const [service_name,document_type,bill_id] of [['楽天カード','PDF','bill-rakuten'],['エポスカード','PDF','bill-epos'],['PayPay','CSV',null]]) {
     state=put(state,'documents',{document_month:'2026-11',service_name,document_type,bill_id,legacy_file_path:'2026-11_'+service_name+'.'+document_type.toLowerCase(),recorded_at:'2026-11-15T02:00:00.000Z'})
+  }
+  const end=today().slice(0,7)
+  for (let offset=5;offset>=0;offset--) {
+    const month=new Date(Number(end.slice(0,4)),Number(end.slice(5))-1-offset,1)
+    const ym=month.getFullYear()+'-'+String(month.getMonth()+1).padStart(2,'0')
+    for (const [kind,title,category,amount,day] of [
+      ['income','給与','給与',284000,5],['income','副収入','その他',18000+offset*1000,9],
+      ['expense','住まいの支払い','住居',72000,6],['expense','日用品・食費','生活費',23600+offset*750,10]
+    ]) {
+      const occurred_on=ym+'-'+String(day).padStart(2,'0')
+      state=put(state,'transactions',{kind,title,category,amount_jpy:amount,occurred_on,account_id:'jp',to_account_id:null,status:occurred_on<=today()?'posted':'planned',note:null,recorded_at:ym+'-10T02:00:00.000Z',updated_at:ym+'-10T02:00:00.000Z'})
+    }
+    const prior=new Date(month.getFullYear(),month.getMonth()-1,1)
+    const statement_month=prior.getFullYear()+'-'+String(prior.getMonth()+1).padStart(2,'0')
+    const paid=ym+'-12'<=today()
+    state=put(state,'bills',{card_id:'rakuten',statement_month,payment_date:ym+'-12',amount_jpy:65800+offset*950,payment_status:paid?'Paid':'Confirmed',paid_on:paid?ym+'-12':null,debit_account_id:'jp',reporting_disposition:'included',updated_at:ym+'-12T02:00:00.000Z'})
   }
   return state
 }
