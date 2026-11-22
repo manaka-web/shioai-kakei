@@ -12,16 +12,59 @@ concurrency:
   group: pages
   cancel-in-progress: false
 jobs:
-  deploy:
+  prepare:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
+        id: upload
         with:
+          name: github-pages
           path: site
+  deploy:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Confirm uploaded Pages artifact
+        uses: actions/github-script@v8
+        env:
+          EXPECTED_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+        with:
+          retries: 3
+          script: |
+            const expected = Number(process.env.EXPECTED_ARTIFACT_ID)
+            if (!Number.isSafeInteger(expected) || expected <= 0) {
+              throw new Error('The upload did not return a valid artifact ID.')
+            }
+            for (let attempt = 0; attempt < 30; attempt++) {
+              const response = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId,
+                per_page: 100
+              })
+              const artifact = response.data.artifacts.find(item =>
+                item.id === expected && item.name === 'github-pages' &&
+                !item.expired && item.size_in_bytes > 0
+              )
+              if (artifact) {
+                core.info('Confirmed the uploaded Pages artifact.')
+                return
+              }
+              if (attempt < 29) await new Promise(resolve => setTimeout(resolve, 2000))
+            }
+            throw new Error('The Pages artifact is not visible yet. Re-run all jobs.')
       - uses: actions/deploy-pages@v4
         id: deploy
+        with:
+          artifact_name: github-pages
